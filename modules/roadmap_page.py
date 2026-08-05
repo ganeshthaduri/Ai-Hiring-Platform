@@ -165,5 +165,5 @@ def render():
 
     st.divider()
     if st.button("Continue to Recruiter Dashboard →"):
-        st.session_state.nav_target = "Recruiter Dashboard"
+        st.session_state.nav_target = "Dashboard"
         st.rerun()

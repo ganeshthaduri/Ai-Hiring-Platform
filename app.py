@@ -39,7 +39,7 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    #MainMenu, footer, header {visibility: hidden;}
+    #MainMenu, footer {visibility: hidden;}
     .block-container {padding-top: 1.6rem;}
     :root {
         --primary: #4F46E5;   /* blue */
@@ -61,7 +61,7 @@ st.markdown(
 # ---------------------------------------------------------------------------
 NAV_TREE = {
     "🏠 Home": ["Home"],
-    "👤 Candidate": ["Resume Analysis", "AI Interview", "Interview Report", "Learning Roadmap"],
+    "👤 Candidate": ["Resume Analysis", "AI Mock Interview", "Interview Report", "Learning Roadmap"],
     "👨‍💼 Recruiter": ["Dashboard", "Reports"],
     "⚙️ Settings": ["Settings"],
 }
@@ -72,7 +72,7 @@ NAV_TREE = {
 PAGE_MAP = {
     "Home": home_page.render,
     "Resume Analysis": resume_page.render,
-    "AI Interview": interview_page.render,
+    "AI Mock Interview": interview_page.render,
     "Interview Report": interview_page.render,
     "Learning Roadmap": roadmap_page.render,
     "Dashboard": recruiter_dashboard.render,
@@ -83,7 +83,7 @@ PAGE_MAP = {
 if "current_page" not in st.session_state:
     st.session_state.current_page = "Home"
 
-# Allow other pages to programmatically navigate (e.g. "Continue to AI Interview →")
+# Allow other pages to programmatically navigate (e.g. "Continue to AI Mock Interview →")
 if "nav_target" in st.session_state:
     st.session_state.current_page = st.session_state.pop("nav_target")
 
@@ -105,7 +105,7 @@ with st.sidebar:
 # webcam thread, exactly like the old face.py's "leaving Live Monitoring"
 # guard — prevents an orphaned camera thread running in the background.
 # ---------------------------------------------------------------------------
-if st.session_state.current_page != "AI Interview" and st.session_state.get("camera_running"):
+if st.session_state.current_page != "AI Mock Interview" and st.session_state.get("camera_running"):
     interview_page.stop_session()
 
 # ---------------------------------------------------------------------------

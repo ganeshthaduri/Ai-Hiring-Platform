@@ -560,7 +560,7 @@ def _init_state():
 
 def render():
     _init_state()
-    st.title("🎥 AI Interview")
+    st.title("🎥 AI Mock Interview")
 
     if st.session_state.interview_stage == "setup":
         _render_setup()
@@ -574,14 +574,14 @@ def render():
 # Stage 1 — setup
 # ---------------------------------------------------------------------------
 def _render_setup():
-    st.info(
-        "Start the interview and speak freely about your background, projects, and experience "
-        "while the interviewer asks questions on their end. "
-        "No questions are generated or shown by this page."
-    )
+    # st.info(
+    #     # "Start the interview and speak freely about your background, projects, and experience "
+    #     "while the interviewer asks questions on their end. "
+    #     "No questions are generated or shown by this page."
+    # )
     st.caption(
-        "You'll be asked to allow camera + microphone access in your browser. Your face, attention, "
-        "and behavior are tracked throughout, and your speech is transcribed live — nothing is uploaded anywhere."
+        "You'll be asked to allow camera & microphone access in your browser. Your face, attention, "
+        "and behavior will be tracked throughout, and your speech will be transcribed live"
     )
     if st.button("▶️ Start Interview", type="primary"):
         st.session_state.qa_records = []
