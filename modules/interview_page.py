@@ -126,7 +126,7 @@ except Exception:
     _FunASRAutoModel = None
     _sensevoice_postprocess = None
 
-from backend.detect import process_frame
+from backend.detect import process_frame, reset_calibration
 from backend import session_store, candidate_store, llm_evaluator
 from backend.transcript_utils import append_transcript
 
@@ -521,8 +521,35 @@ class TranscriptionWorker:
 # ---------------------------------------------------------------------------
 # Violation snapshots — same cooldown pattern as face1.py, so the
 # existing Session Report tab keeps working unmodified.
+#
+# This cooldown also gates DISTRACTION COUNTING (distraction_counts
+# below): each time a violation type is actually logged (i.e. it's been
+# active for >= VIOLATION_COOLDOWN_SECONDS since the last time this same
+# type was logged), the running total for that type is incremented too.
+# That means the count reflects distinct occurrences spaced >= 5s apart,
+# not a raw per-frame tally — a candidate who looks left continuously for
+# 30s counts as ~6, not several hundred (one per analyzed frame).
 # ---------------------------------------------------------------------------
-VIOLATION_COOLDOWN_SECONDS = 5.0
+VIOLATION_COOLDOWN_SECONDS = 15
+
+# Every parameter we count "distraction occurred" for on the scoring
+# page, and the (behavior|objects) analysis dict + key each maps to.
+# Single source of truth — used both to log/count during the interview
+# and to render the summary table on the report page, so the two can't
+# drift out of sync.
+DISTRACTION_PARAMETERS = [
+    ("Looking Left",          "behavior", "looking_left"),
+    ("Looking Right",         "behavior", "looking_right"),
+    ("Multiple Faces",        "behavior", "multiple_faces"),
+    # Face Covered/Missing now also covers a hand on the face/eyes —
+    # detect.py folds hand_on_face/hand_on_eyes into behavior.face_missing
+    # itself, so a hand covering the face is one flagged occurrence here,
+    # not a second, separate "Hand On Face"/"Hand On Eyes" count.
+    ("Face Covered/Missing",  "behavior", "face_missing"),
+    ("Phone Detected",        "objects",  "phone_detected"),
+    ("Object On Face",        "objects",  "object_on_face"),
+    ("Object On Eyes",        "objects",  "object_on_eyes"),
+]
 
 
 def _maybe_log_violation(frame_bgr, violation_type, is_active):
@@ -535,6 +562,8 @@ def _maybe_log_violation(frame_bgr, violation_type, is_active):
         except Exception:
             pass
         st.session_state._last_violation_time[violation_type] = time.time()
+        st.session_state.distraction_counts[violation_type] = \
+            st.session_state.distraction_counts.get(violation_type, 0) + 1
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +581,11 @@ def _init_state():
         "transcript_segments": [],   # [{"t": elapsed_seconds, "text": "..."}] — timed transcription
         "session_start_time": None,  # set when Start Interview is clicked; basis for all timestamps
         "_last_violation_time": {},
+        "distraction_counts": {},     # {"Looking Left": 3, "Phone Detected": 1, ...} — see DISTRACTION_PARAMETERS
+        # Bumped every time "Start Interview" is clicked and used as part
+        # of webrtc_streamer's `key` below. See the note above that call
+        # for why this can't just be a fixed string.
+        "media_session_id": 0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -584,12 +618,33 @@ def _render_setup():
         "and behavior will be tracked throughout, and your speech will be transcribed live"
     )
     if st.button("▶️ Start Interview", type="primary"):
+        # detect.py's calibration state (_state["calibrated"], neutral_yaw/
+        # neutral_pitch) lives in a MODULE-LEVEL dict, not st.session_state
+        # — it survives across Streamlit reruns AND across different
+        # candidates' sessions in the same server process. Without this
+        # call, calibration only ever runs once (on whoever's face is
+        # first seen after the server starts) and every candidate after
+        # that reuses that first person's neutral pose, which is exactly
+        # why it "isn't working" for anyone else. Must be called here,
+        # each time a NEW interview starts, so this candidate gets their
+        # own ~3s calibration window instead of inheriting someone else's.
+        reset_calibration()
         st.session_state.qa_records = []
         st.session_state.interview_stage = "in_progress"
         st.session_state.camera_running = True
         st.session_state.live_transcript = ""
         st.session_state.transcript_segments = []
         st.session_state.session_start_time = time.time()
+        # Fresh counts/cooldowns for this attempt — without this, counts
+        # from a previous attempt in the same browser session (e.g. after
+        # "Retake Interview") would keep accumulating into this one.
+        st.session_state.distraction_counts = {}
+        st.session_state._last_violation_time = {}
+        # New webrtc_streamer key for this attempt (see the note above
+        # that call in _render_interview) — required so camera/mic
+        # actually (re)start on a second or later "Start Interview" click
+        # in the same browser session, not just the first.
+        st.session_state.media_session_id += 1
         st.rerun()
 
 
@@ -630,8 +685,23 @@ def _render_interview():
         # ONE combined connection for video + audio — this is the actual
         # candidate webcam/mic, captured through the browser, not a
         # device attached to the server.
+        #
+        # IMPORTANT: the key includes media_session_id, which is bumped
+        # once each time the "Start Interview" button is clicked (see
+        # _render_setup). streamlit-webrtc ties a component's internal
+        # RTCPeerConnection / media-stream state to its `key`, on both
+        # the frontend and in st.session_state. With a fixed key here,
+        # the very first interview attempt in a browser session works
+        # fine, but leaving this stage (End Interview without finishing,
+        # navigating away, "Retake Interview", etc.) and then clicking
+        # "Start Interview" again reuses that exact same component
+        # instance instead of creating a new one — so the browser never
+        # issues a fresh getUserMedia()/RTCPeerConnection request, and
+        # camera + mic silently fail to (re)start on the second attempt
+        # onward. Changing the key on every attempt forces a genuinely
+        # new component/connection each time.
         media_ctx = webrtc_streamer(
-            key="interview-media",
+            key=f"interview-media-{st.session_state.media_session_id}",
             mode=WebRtcMode.SENDONLY,
             rtc_configuration=RTC_CONFIGURATION,
             video_receiver_size=128,
@@ -794,6 +864,9 @@ def _render_interview():
                         _maybe_log_violation(frame, "Face Covered/Missing", analysis["behavior"]["face_missing"])
                         _maybe_log_violation(frame, "Object On Face", analysis["objects"]["object_on_face"])
                         _maybe_log_violation(frame, "Multiple Faces", analysis["behavior"]["multiple_faces"])
+                        _maybe_log_violation(frame, "Looking Left", analysis["behavior"]["looking_left"])
+                        _maybe_log_violation(frame, "Looking Right", analysis["behavior"]["looking_right"])
+                        _maybe_log_violation(frame, "Object On Eyes", analysis["objects"]["object_on_eyes"])
 
                         st.session_state.attention_samples.append(analysis["attention"].get("score", 0))
                         st.session_state.eye_contact_samples.append(
@@ -828,8 +901,25 @@ def _render_interview():
 | Blur | {'✅' if blur_ok else '⚠️'} {analysis['quality']['blur']} |
 """)
 
+                        _attn_status = analysis['attention']['status']
+                        if _attn_status == 'Focused':
+                            _attn_icon = '🟢'
+                        elif _attn_status == 'Calibrating':
+                            # Distinct from red/Distracted — calibration
+                            # treats the candidate as attentive (see
+                            # detect.py), so showing red here would read
+                            # as a false "you're distracted" for the ~3s
+                            # neutral-pose window right at session start.
+                            _attn_icon = '🟡'
+                        else:
+                            _attn_icon = '🔴'
+                        _attn_label = _attn_status
+                        if _attn_status == 'Calibrating':
+                            _progress_pct = int(analysis['attention'].get('calibration_progress', 0) * 100)
+                            _attn_label = f"Calibrating... please look at the screen ({_progress_pct}%)"
+
                         monitoring_box.markdown(f"""
-#### {'🟢' if analysis['attention']['status'] == 'Focused' else '🔴'} {analysis['attention']['status']}
+#### {_attn_icon} {_attn_label}
 
 **Attention**
 
@@ -990,27 +1080,27 @@ def _render_interview():
                             level_pct,
                             text=("🎤 Audio detected — speaking" if speaking else "🎧 Mic connected — listening"),
                         )
-                        st.caption(
-                            f"RMS level: {latest_mic_rms:.4f}  •  silence threshold: {STT_SILENCE_RMS_THRESHOLD}  "
-                            f"•  frames received: {total_audio_frames_received}"
-                        )
-                        st.caption(
-                            f"Buffer building: {sound_buffer.size / STT_TARGET_SR:.2f}s  "
-                            f"•  silence run: {silence_run_seconds:.2f}s  "
-                            f"•  pause trigger: {STT_PAUSE_TRIGGER_SECONDS}s  •  max cap: {STT_MAX_CHUNK_SECONDS}s"
-                        )
-                        if last_chunk_rms is not None:
-                            st.caption(
-                                f"Last resampled chunk: {last_chunk_seconds:.2f}s  •  chunk RMS: {last_chunk_rms:.5f}  "
-                                f"•  flushed: {chunks_flushed}  •  passed silence gate & submitted: {chunks_submitted}  "
-                                f"•  worker ready: {worker.is_ready()}  •  worker busy: {worker.busy}"
-                            )
-                            st.caption(
-                                f"Raw non-empty model outputs so far: {raw_transcriptions_count}  "
-                                f"•  last raw output: {last_raw_model_output!r}"
-                            )
-                        else:
-                            st.caption("Last resampled chunk: none flushed yet (buffer still filling)")
+                        # st.caption(
+                        #     f"RMS level: {latest_mic_rms:.4f}  •  silence threshold: {STT_SILENCE_RMS_THRESHOLD}  "
+                        #     f"•  frames received: {total_audio_frames_received}"
+                        # )
+                        # st.caption(
+                        #     f"Buffer building: {sound_buffer.size / STT_TARGET_SR:.2f}s  "
+                        #     f"•  silence run: {silence_run_seconds:.2f}s  "
+                        #     f"•  pause trigger: {STT_PAUSE_TRIGGER_SECONDS}s  •  max cap: {STT_MAX_CHUNK_SECONDS}s"
+                        # )
+                        # if last_chunk_rms is not None:
+                        #     st.caption(
+                        #         f"Last resampled chunk: {last_chunk_seconds:.2f}s  •  chunk RMS: {last_chunk_rms:.5f}  "
+                        #         f"•  flushed: {chunks_flushed}  •  passed silence gate & submitted: {chunks_submitted}  "
+                        #         f"•  worker ready: {worker.is_ready()}  •  worker busy: {worker.busy}"
+                        #     )
+                        #     st.caption(
+                        #         f"Raw non-empty model outputs so far: {raw_transcriptions_count}  "
+                        #         f"•  last raw output: {last_raw_model_output!r}"
+                        #     )
+                        # else:
+                        #     st.caption("Last resampled chunk: none flushed yet (buffer still filling)")
             elif not shown_waiting_mic_msg:
                 mic_level_box.info("🎙️ Waiting for microphone connection — click **Start** above.")
                 shown_waiting_mic_msg = True
@@ -1098,6 +1188,27 @@ def _render_report():
         st.write(f"{dim.replace('_', ' ').title()} — {score}%")
         st.progress(min(1.0, score / 100))
 
+    st.divider()
+    st.markdown("**🚩 Distraction Summary**")
+    st.caption(
+        "How many separate times each behavior/object was flagged during the "
+        "session (counts are spaced at least 5s apart, so one long lapse "
+        "counts as a few occurrences, not hundreds of frames)."
+    )
+    _counts = st.session_state.get("distraction_counts", {})
+    _total_flags = sum(_counts.get(label, 0) for label, _, _ in DISTRACTION_PARAMETERS)
+    if _total_flags == 0:
+        st.success("No distractions flagged during this session.")
+    else:
+        _rows = "\n".join(
+            f"| {label} | {_counts.get(label, 0)} |" for label, _, _ in DISTRACTION_PARAMETERS
+        )
+        st.markdown(f"""
+| Parameter | Count |
+|-----------|-------|
+{_rows}
+""")
+
     if st.session_state.get("transcript_segments"):
         st.divider()
         st.markdown("**🕒 Timestamped Transcript**")
@@ -1127,7 +1238,8 @@ def _render_report():
     with c1:
         if st.button("🔁 Retake Interview"):
             for k in ["qa_records", "interview_report", "attention_samples", "eye_contact_samples",
-                      "transcript_segments", "live_transcript", "session_start_time"]:
+                      "transcript_segments", "live_transcript", "session_start_time",
+                      "distraction_counts", "_last_violation_time"]:
                 st.session_state.pop(k, None)
             st.session_state.interview_stage = "setup"
             st.rerun()

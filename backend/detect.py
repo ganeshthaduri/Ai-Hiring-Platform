@@ -126,6 +126,11 @@ FACE_CROP_PAD_RATIO = 0.3
 FACEMESH_EVERY_N_FRAMES = 8
 DRAW_LANDMARKS = False       # draw the 468 FaceMesh dots on the frame (adds per-frame cost + visual clutter)
 
+# Same throttling rationale as FaceMesh above — hand landmark inference
+# isn't free, so it's only re-run every N frames and the last result
+# reused in between, rather than tracking hands every single frame.
+HANDS_EVERY_N_FRAMES = 5
+
 # Head-pose direction thresholds (degrees). This head-pose estimate uses
 # only 6 sparse landmark points with no per-person calibration, so pitch
 # in particular is noisy — a normal desk glance-down may not produce a
@@ -152,6 +157,20 @@ PITCH_DOWN_THRESHOLD = 10  # lowered from 18 — was likely too strict to ever t
 # same YAW_THRESHOLD/PITCH_*_THRESHOLD values above work across different
 # webcam heights, laptops, sitting posture, and users, instead of only
 # being correct for whatever setup they were tuned on.
+#
+# Split into two phases rather than one flat window:
+#   1. CALIBRATION_SETTLE_SECONDS — elapses first, samples are NOT
+#      collected. This exists because calibration starts the instant a
+#      face is tracked, which is typically right after the candidate
+#      clicked "Start Interview" — they're often still mid-motion:
+#      settling into their chair, glancing away from the mouse/keyboard
+#      back up to the screen, reacting to the "Calibrating..." text
+#      appearing. Averaging that motion in as "neutral" was the actual
+#      cause of a centered, genuinely-attentive pose later reading as
+#      Up/Distracted (a normal pose deviates from a skewed baseline).
+#   2. CALIBRATION_DURATION_SECONDS — the actual sampling window, once
+#      the candidate has had a moment to settle.
+CALIBRATION_SETTLE_SECONDS = 1.5
 CALIBRATION_DURATION_SECONDS = 3.0
 CALIBRATION_MIN_SAMPLES = 5  # guard against a too-short/low-FPS window producing a noisy average
 
@@ -224,6 +243,24 @@ face_mesh = mp_face_mesh.FaceMesh(
 )
 print("[INFO] FaceMesh loaded.")
 
+print("[INFO] Loading MediaPipe Hands...")
+# Dedicated hand model — needed for a case neither of the two existing
+# occlusion checks can catch: a hand covering the eyes/face.
+#   - The YOLO-based check (_check_object_overlap) only fires for COCO
+#     classes; "hand" isn't one of them.
+#   - The skin-tone check (_skin_ratio) fires when a region stops
+#     looking like skin — a hand IS skin, so it reads as "still skin"
+#     and never trips that check, no matter how fully it covers the eyes.
+# Hand presence/position needs its own signal, independent of both.
+mp_hands = mdp.solutions.hands
+hands_detector = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=2,
+    min_detection_confidence=0.6,
+    min_tracking_confidence=0.6
+)
+print("[INFO] MediaPipe Hands loaded.")
+
 print("[INFO] Loading YOLO26n model for object detection...")
 model = YOLO(str(yolo_model))  # yolov26n.pt is the smallest, fastest model; yolov26s.pt is a bit more accurate but slower
 
@@ -244,6 +281,18 @@ print("[INFO] YOLO26n model loaded.")
 
 YOLO_INFERENCE_SIZE = 512  # smaller than the default 640 -> much faster, some accuracy trade-off
 
+# Ultralytics defaults to conf=0.25 if this isn't passed explicitly.
+# Made explicit here so it's easy to find/tune: an unusual-looking object
+# held to the face (e.g. a diary/pouch rather than a plain book) may not
+# hit even this confidence as "book"/"handbag" and so won't appear in
+# detections at all, in which case no face-box fix helps, since there's
+# nothing to overlap. If object_on_face still misses an obvious object
+# after the box-padding fix, check analysis["objects"]["detected"] for
+# that frame — if the object never appears there under ANY class, try
+# lowering this toward 0.15-0.2 (trade-off: more false positives on
+# background clutter elsewhere in frame).
+YOLO_CONF_THRESHOLD = 0.25
+
 # 3D face model points used for solvePnP head-pose estimation
 FACE_MODEL_3D = {
     1: (0.0, 0.0, 0.0),        # Nose tip
@@ -260,6 +309,23 @@ RIGHT_IRIS = [469, 470, 471, 472]
 LEFT_EYE_CORNERS = (33, 133)
 RIGHT_EYE_CORNERS = (362, 263)
 
+# Landmark indices for the generic (class-agnostic) occlusion check — see
+# _skin_ratio() below. Reuses the same corner/chin points already trusted
+# elsewhere in this file (FACE_MODEL_3D, LEFT/RIGHT_EYE_CORNERS above)
+# plus eyelid and lip-center points, to build tight regions around the
+# eyes and the nose/mouth/chin without needing a full landmark polygon.
+EYES_REGION_LANDMARKS = [33, 133, 159, 145, 362, 263, 386, 374]
+LOWER_FACE_REGION_LANDMARKS = [1, 61, 291, 13, 14, 199]
+
+# How far a region's skin-pixel ratio has to drop below its own
+# session-calibrated baseline (see CALIBRATION_DURATION_SECONDS) before
+# it's treated as occluded. 0.30 = 30 percentage points, e.g. baseline
+# 70% skin -> flags once current reading is below 40%. Deliberately
+# conservative (not tripped by shadows, a stray strand of hair, or normal
+# lighting drift) — this check exists to catch objects YOLO can't
+# classify, not to replace the YOLO check as the primary signal.
+OCCLUSION_SKIN_DROP_THRESHOLD = 0.30
+
 # ------------------------------------------------------------
 # Module-level state that must persist between process_frame() calls
 # (this replaces the local variables that used to live inside the
@@ -269,6 +335,7 @@ _state = {
     "frame_count": 0,
     "last_faces": [],
     "last_yolo_detections": [],  # cached YOLO results, refreshed every YOLO_EVERY_N_FRAMES
+    "last_hand_boxes": [],       # cached MediaPipe Hands bboxes (full-frame pixel coords), refreshed every HANDS_EVERY_N_FRAMES
     "last_face_box": None,       # [x, y, x2, y2] of the last successfully detected face
     "last_face_seen_time": 0.0,
     "prev_time": time.time(),
@@ -293,6 +360,15 @@ _state = {
     "calibration_pitch_samples": [],
     "neutral_yaw": 0.0,
     "neutral_pitch": 0.0,
+
+    # ---- Same calibration window, but for the appearance-based
+    # occlusion check (_skin_ratio) instead of pose. What "unoccluded"
+    # looks like also varies per-person/per-lighting, same reasoning as
+    # neutral_yaw/neutral_pitch above.
+    "calibration_eyes_skin_samples": [],
+    "calibration_mouth_skin_samples": [],
+    "neutral_eyes_skin_ratio": None,
+    "neutral_mouth_skin_ratio": None,
 }
 
 # How long to keep trusting the last known face position after detection
@@ -319,6 +395,10 @@ def reset_calibration():
     _state["calibration_pitch_samples"] = []
     _state["neutral_yaw"] = 0.0
     _state["neutral_pitch"] = 0.0
+    _state["calibration_eyes_skin_samples"] = []
+    _state["calibration_mouth_skin_samples"] = []
+    _state["neutral_eyes_skin_ratio"] = None
+    _state["neutral_mouth_skin_ratio"] = None
     _state["yaw_ema"] = None
     _state["pitch_ema"] = None
     _state["gaze_ratio_ema"] = None
@@ -328,22 +408,144 @@ def reset_calibration():
 
 def _check_object_overlap(detected_objects, face_box):
     """Returns (object_on_face, object_on_eyes) by checking detected YOLO
-    boxes (excluding 'person') against the face box and its upper half."""
+    boxes (excluding 'person' and 'hand') against the face box and its
+    upper half.
+
+    'hand' is excluded on purpose, not just 'person': hand entries get
+    appended into this same `detected` list (see the MediaPipe Hands
+    block in process_frame) so they show up in the objects table, but a
+    hand's bounding box is the min/max extent of all 21 landmarks —
+    loose enough that it very often rectangle-overlaps the (already
+    padded) face/eyes box during ordinary gestures, touching hair, or
+    resting near the chin, without the hand actually covering the face.
+    That was the main cause of object_on_face/object_on_eyes reading
+    True with nothing actually on the face or eyes. Hands have their own
+    dedicated, purpose-built check — _check_hand_on_face — so they must
+    not also be counted here, or every hand-near-face moment double-hits
+    both checks."""
     fx, fy, fx2, fy2 = face_box
     eyes_box = [fx, fy, fx2, fy + int((fy2 - fy) * 0.5)]
 
     on_face = False
     on_eyes = False
 
+    # Require a meaningful intersection area before counting an object
+    # as being "on" the face/eyes. This avoids tiny edge-touching boxes
+    # or spurious detections from the background being counted.
+    fx1, fy1, fx2, fy2 = face_box
+    face_area = max(1, (fx2 - fx1) * (fy2 - fy1))
+
     for obj in detected_objects:
-        if obj["class"] == "person":
+        if obj["class"] in ("person", "hand"):
             continue
-        if boxes_overlap(obj["bbox"], face_box):
+        bx1, by1, bx2, by2 = obj.get("bbox", [0, 0, 0, 0])
+        # compute intersection
+        ix1 = max(fx1, bx1)
+        iy1 = max(fy1, by1)
+        ix2 = min(fx2, bx2)
+        iy2 = min(fy2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            continue
+        inter_area = (ix2 - ix1) * (iy2 - iy1)
+        obj_area = max(1, (bx2 - bx1) * (by2 - by1))
+
+        # thresholds: require intersection to be at least a small
+        # fraction of the face area OR a small fraction of the object
+        # area to count as overlapping in a meaningful way.
+        if inter_area >= 0.02 * face_area or inter_area >= 0.05 * obj_area:
+            # overlapping with whole face box
             on_face = True
-        if boxes_overlap(obj["bbox"], eyes_box):
+
+        # eyes overlap check (same logic but against eyes_box)
+        ex1, ey1, ex2, ey2 = eyes_box
+        ix1 = max(ex1, bx1)
+        iy1 = max(ey1, by1)
+        ix2 = min(ex2, bx2)
+        iy2 = min(ey2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            continue
+        inter_area_eyes = (ix2 - ix1) * (iy2 - iy1)
+        if inter_area_eyes >= 0.02 * face_area or inter_area_eyes >= 0.05 * obj_area:
             on_eyes = True
 
     return on_face, on_eyes
+
+
+def _hand_landmarks_to_bbox(hand_landmarks, img_w, img_h):
+    """Converts one MediaPipe Hands landmark set (normalized 0-1 coords,
+    relative to the full frame that was fed to hands_detector.process())
+    into a full-frame pixel [x, y, x2, y2] bbox."""
+    xs = [lm.x * img_w for lm in hand_landmarks.landmark]
+    ys = [lm.y * img_h for lm in hand_landmarks.landmark]
+    return [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
+
+
+def _check_hand_on_face(hand_boxes, face_box):
+    """Same idea as _check_object_overlap, but for MediaPipe Hands boxes.
+    This is the check that catches a hand covering the eyes — neither the
+    YOLO check (no 'hand' COCO class) nor the skin-tone check (a hand IS
+    skin, so it never reads as 'not skin') can catch that case."""
+    fx, fy, fx2, fy2 = face_box
+    eyes_box = [fx, fy, fx2, fy + int((fy2 - fy) * 0.5)]
+
+    on_face = False
+    on_eyes = False
+
+    for hand_box in hand_boxes:
+        if boxes_overlap(hand_box, face_box):
+            on_face = True
+        if boxes_overlap(hand_box, eyes_box):
+            on_eyes = True
+
+    return on_face, on_eyes
+
+
+def _region_box_from_landmarks(face_landmarks, indices, img_w, img_h, face_x, face_y, pad_ratio=0.35):
+    """Full-frame pixel bbox around a set of FaceMesh landmark indices,
+    padded outward. Used only for the appearance-based occlusion check
+    below — pad_ratio is generous on purpose, since an occluding object's
+    edge (a notebook, a hand) usually sits a bit outside the exact
+    landmark points, not flush against them."""
+    xs, ys = [], []
+    for idx in indices:
+        lm = face_landmarks.landmark[idx]
+        xs.append(lm.x * img_w + face_x)
+        ys.append(lm.y * img_h + face_y)
+    x1, x2 = min(xs), max(xs)
+    y1, y2 = min(ys), max(ys)
+    pad_x = (x2 - x1) * pad_ratio
+    pad_y = (y2 - y1) * pad_ratio
+    return [x1 - pad_x, y1 - pad_y, x2 + pad_x, y2 + pad_y]
+
+
+def _skin_ratio(frame_bgr, box):
+    """Fraction of pixels inside box that fall within a broad skin-tone
+    HSV range. This is what catches an object YOLO can't classify —
+    a notebook, a mask, paper, whatever — since it works from what the
+    region LOOKS like (skin vs. not-skin) rather than trying to
+    recognize what the covering object IS the way the YOLO-based check
+    above does. Returns None if the box is degenerate/out of frame."""
+    h_frame, w_frame = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = box
+    x1 = max(0, int(x1))
+    y1 = max(0, int(y1))
+    x2 = min(w_frame, int(x2))
+    y2 = min(h_frame, int(y2))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    region = frame_bgr[y1:y2, x1:x2]
+    if region.size == 0:
+        return None
+    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+    # Two ranges because skin hue wraps around 0/180 in OpenCV's 0-180
+    # HSV hue scale. Deliberately broad (covers a wide range of skin
+    # tones under typical, imperfect webcam lighting) since this only
+    # needs to distinguish "roughly skin" from "clearly not skin" —
+    # fine-grained accuracy isn't the goal, catching gross occlusion is.
+    mask1 = cv2.inRange(hsv, (0, 20, 40), (25, 180, 255))
+    mask2 = cv2.inRange(hsv, (170, 20, 40), (180, 180, 255))
+    mask = cv2.bitwise_or(mask1, mask2)
+    return float(np.count_nonzero(mask)) / mask.size
 
 
 def _empty_analysis():
@@ -465,7 +667,7 @@ def process_frame(frame):
 
     # ---------------- YOLO object detection (throttled) ----------------
     if _state["frame_count"] % YOLO_EVERY_N_FRAMES == 0:
-        yolo_results = model(frame, imgsz=YOLO_INFERENCE_SIZE, verbose=False)
+        yolo_results = model(frame, imgsz=YOLO_INFERENCE_SIZE, conf=YOLO_CONF_THRESHOLD, verbose=False)
 
         detections = []
         phone_detected = False
@@ -496,11 +698,42 @@ def process_frame(frame):
         }
 
     cached = _state["last_yolo_detections"] or {"detected": [], "phone_detected": False, "person_count": 0}
-    analysis["objects"]["detected"] = cached["detected"]
+    # Copy rather than alias — hand entries get appended to this list
+    # below, and cached["detected"] is the same object stored in
+    # _state that gets reused as-is on throttled (non-YOLO) frames;
+    # appending directly to it would keep growing that cached list
+    # every frame instead of rebuilding it fresh each time.
+    analysis["objects"]["detected"] = list(cached["detected"])
     analysis["objects"]["phone_detected"] = cached["phone_detected"]
     analysis["objects"]["person_count"] = cached["person_count"]
 
     analysis["behavior"]["multiple_faces"] = analysis["objects"]["person_count"] > 1
+
+    # ---------------- MediaPipe Hands detection (throttled) ----------------
+    # Runs on the full frame (hands can be anywhere, not just near the
+    # face) rather than a face crop. Needed alongside the YOLO and
+    # skin-tone checks — see _check_hand_on_face's docstring for why
+    # neither of those can catch a hand by itself.
+    if _state["frame_count"] % HANDS_EVERY_N_FRAMES == 0:
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        hand_results = hands_detector.process(rgb_frame)
+        hand_boxes = []
+        if hand_results.multi_hand_landmarks:
+            for hlm in hand_results.multi_hand_landmarks:
+                hand_boxes.append(_hand_landmarks_to_bbox(hlm, w, h))
+        _state["last_hand_boxes"] = hand_boxes
+
+    hand_boxes = _state["last_hand_boxes"]
+
+    # Surface each detected hand in the same "detected" list YOLO objects
+    # go into, so hands show up in the objects table alongside phone/
+    # person too, not just as the hand_on_face/hand_on_eyes booleans.
+    for hand_box in hand_boxes:
+        analysis["objects"]["detected"].append({
+            "class": "hand",
+            "confidence": None,
+            "bbox": hand_box
+        })
 
     # ---------------- YuNet face detection (throttled) ----------------
     if _state["frame_count"] % DETECT_EVERY_N_FRAMES == 0:
@@ -531,6 +764,10 @@ def process_frame(frame):
             analysis["objects"]["object_on_face"] = on_face
             analysis["objects"]["object_on_eyes"] = on_eyes
 
+            hand_on_face, hand_on_eyes = _check_hand_on_face(hand_boxes, _state["last_face_box"])
+            analysis["objects"]["hand_on_face"] = hand_on_face
+            analysis["objects"]["hand_on_eyes"] = hand_on_eyes
+
         current_time = time.time()
         fps = 1 / max(current_time - _state["prev_time"], 1e-6)
         _state["prev_time"] = current_time
@@ -558,9 +795,18 @@ def process_frame(frame):
     # camera. Padding the crop before running FaceMesh gives it the full
     # face to work with, so the landmarks (and the pose computed from
     # them) reflect reality instead of the detector's tight box.
-    # The rest of this function (visibility/size checks, the drawn box,
-    # occlusion memory) intentionally keeps using the RAW x/y/x2/y2/fw/fh
-    # above — only the crop fed to FaceMesh is padded.
+    #
+    # This same tight box is also *why* object-on-face/object-on-eyes
+    # under-detected a notebook/book held up to the face: an object
+    # covering the lower face (mouth/chin/nose) can sit entirely below
+    # the raw YuNet box's bottom edge — so boxes_overlap() against the
+    # raw box correctly finds no overlap even though the object is
+    # plainly covering part of the face. The padded box below is what's
+    # now used for the object-overlap check (and stored as
+    # last_face_box for the occlusion-memory paths), while visibility/
+    # size checks and the drawn box below intentionally keep using the
+    # RAW x/y/x2/y2/fw/fh — those measure the detector's own confidence
+    # in where the face is, which padding would misrepresent.
     pad_w = int(fw * FACE_CROP_PAD_RATIO)
     pad_h = int(fh * FACE_CROP_PAD_RATIO)
     mesh_x = max(0, x - pad_w)
@@ -583,6 +829,10 @@ def process_frame(frame):
             analysis["objects"]["object_on_face"] = on_face
             analysis["objects"]["object_on_eyes"] = on_eyes
 
+            hand_on_face, hand_on_eyes = _check_hand_on_face(hand_boxes, _state["last_face_box"])
+            analysis["objects"]["hand_on_face"] = hand_on_face
+            analysis["objects"]["hand_on_eyes"] = hand_on_eyes
+
         draw_face_boxes(frame, last_faces, primary_ok=False)
 
         current_time = time.time()
@@ -595,7 +845,10 @@ def process_frame(frame):
 
     # Remember this face's position for occlusion checks on future frames
     # where detection fails (e.g. face fully covered by a book/phone).
-    _state["last_face_box"] = [x, y, x2, y2]
+    # Padded box (see note above pad_w/pad_h) — the whole point of
+    # remembering this is to catch an object occluding the face, so it
+    # needs the same margin as the live check below, not the tight box.
+    _state["last_face_box"] = [mesh_x, mesh_y, mesh_x2, mesh_y2]
     _state["last_face_seen_time"] = time.time()
 
     # ---------------- Face quality ----------------
@@ -619,9 +872,36 @@ def process_frame(frame):
     })
 
     # ---------------- object-on-face / object-on-eyes heuristic ----------------
-    on_face, on_eyes = _check_object_overlap(analysis["objects"]["detected"], [x, y, x2, y2])
+    # Uses the padded box, not the raw [x, y, x2, y2] — see the note above
+    # pad_w/pad_h for why the raw box under-detects a book/notebook held
+    # up against the lower face.
+    on_face, on_eyes = _check_object_overlap(
+        analysis["objects"]["detected"], [mesh_x, mesh_y, mesh_x2, mesh_y2]
+    )
     analysis["objects"]["object_on_face"] = on_face
     analysis["objects"]["object_on_eyes"] = on_eyes
+
+    # ---------------- hand-on-face / hand-on-eyes heuristic ----------------
+    # This is the one that catches a hand over the eyes specifically —
+    # see _check_hand_on_face's docstring for why neither the check just
+    # above nor the skin-tone check further down (once landmarks are
+    # available) can catch a hand on their own.
+    hand_on_face, hand_on_eyes = _check_hand_on_face(hand_boxes, [mesh_x, mesh_y, mesh_x2, mesh_y2])
+    analysis["objects"]["hand_on_face"] = hand_on_face
+    analysis["objects"]["hand_on_eyes"] = hand_on_eyes
+
+    # A hand on the face/eyes is treated as the face being covered, i.e.
+    # the same outcome as face_missing — not a separate distraction type.
+    # Per-product decision: candidates shouldn't be double-flagged for
+    # "hand on face" AND "face covered" as two different violations for
+    # the same underlying event, and a hand fully over the eyes really is
+    # a covered face for attention-tracking purposes (head pose/gaze
+    # can't be trusted either way while this is true). This is checked
+    # here (face IS currently detected) in addition to the two
+    # last_face_box fallback paths above, which already default
+    # face_missing to True and so don't need this line repeated.
+    if hand_on_face or hand_on_eyes:
+        analysis["behavior"]["face_missing"] = True
 
     # ---------------- MediaPipe FaceMesh (throttled) ----------------
     run_mesh = (_state["frame_count"] % FACEMESH_EVERY_N_FRAMES == 0) or (_state["last_face_landmarks"] is None)
@@ -696,6 +976,19 @@ def process_frame(frame):
 
         raw_pitch, raw_yaw, raw_roll = float(angles[0]), float(angles[1]), float(angles[2])
 
+        # ---- Appearance-based occlusion regions (see STEP 1b below and
+        # _skin_ratio's docstring) — computed here since face_landmarks,
+        # img_w/img_h, and face_x/face_y are all in scope at this point
+        # regardless of whether calibration is still running. ----
+        eyes_region_box = _region_box_from_landmarks(
+            face_landmarks, EYES_REGION_LANDMARKS, img_w, img_h, face_x, face_y
+        )
+        mouth_region_box = _region_box_from_landmarks(
+            face_landmarks, LOWER_FACE_REGION_LANDMARKS, img_w, img_h, face_x, face_y
+        )
+        eyes_skin_ratio = _skin_ratio(frame, eyes_region_box)
+        mouth_skin_ratio = _skin_ratio(frame, mouth_region_box)
+
         # ================================================================
         # STEP 1 — Neutral-pose calibration (runs once per session).
         #
@@ -712,20 +1005,66 @@ def process_frame(frame):
             if _state["calibration_start_time"] is None:
                 _state["calibration_start_time"] = time.time()
 
-            _state["calibration_yaw_samples"].append(raw_yaw)
-            _state["calibration_pitch_samples"].append(raw_pitch)
-
             elapsed = time.time() - _state["calibration_start_time"]
+            settled = elapsed >= CALIBRATION_SETTLE_SECONDS
+
+            # Only start collecting samples once the settle phase has
+            # passed — see the note above CALIBRATION_SETTLE_SECONDS for
+            # why the first ~1.5s specifically must NOT be included.
+            if settled:
+                _state["calibration_yaw_samples"].append(raw_yaw)
+                _state["calibration_pitch_samples"].append(raw_pitch)
+                if eyes_skin_ratio is not None:
+                    _state["calibration_eyes_skin_samples"].append(eyes_skin_ratio)
+                if mouth_skin_ratio is not None:
+                    _state["calibration_mouth_skin_samples"].append(mouth_skin_ratio)
+
+            total_window = CALIBRATION_SETTLE_SECONDS + CALIBRATION_DURATION_SECONDS
             analysis["attention"]["calibrating"] = True
-            analysis["attention"]["calibration_progress"] = round(min(1.0, elapsed / CALIBRATION_DURATION_SECONDS), 2)
+            analysis["attention"]["calibration_progress"] = round(min(1.0, elapsed / total_window), 2)
             analysis["attention"]["yaw"] = round(raw_yaw, 2)
             analysis["attention"]["pitch"] = round(raw_pitch, 2)
             analysis["attention"]["roll"] = round(raw_roll, 2)
 
-            if elapsed >= CALIBRATION_DURATION_SECONDS and \
+            sampling_elapsed = elapsed - CALIBRATION_SETTLE_SECONDS
+            if settled and sampling_elapsed >= CALIBRATION_DURATION_SECONDS and \
                     len(_state["calibration_yaw_samples"]) >= CALIBRATION_MIN_SAMPLES:
-                _state["neutral_yaw"] = float(np.mean(_state["calibration_yaw_samples"]))
-                _state["neutral_pitch"] = float(np.mean(_state["calibration_pitch_samples"]))
+                # Median rather than mean, and outlier-trimmed: a couple
+                # of stray frames inside the sampling window itself
+                # (a blink-driven pitch spike, a half-second glance down
+                # to confirm the mic is picking up audio, etc.) shouldn't
+                # be able to drag the whole baseline the way they would
+                # in a plain average. Trim anything more than 10° from
+                # the raw median, then take the mean of what's left —
+                # robust to occasional outliers while still averaging
+                # down ordinary frame-to-frame jitter within the window.
+                yaw_samples = np.array(_state["calibration_yaw_samples"])
+                pitch_samples = np.array(_state["calibration_pitch_samples"])
+
+                yaw_median = float(np.median(yaw_samples))
+                pitch_median = float(np.median(pitch_samples))
+
+                yaw_inliers = yaw_samples[np.abs(yaw_samples - yaw_median) <= 10]
+                pitch_inliers = pitch_samples[np.abs(pitch_samples - pitch_median) <= 10]
+
+                _state["neutral_yaw"] = float(np.mean(yaw_inliers)) if len(yaw_inliers) > 0 else yaw_median
+                _state["neutral_pitch"] = float(np.mean(pitch_inliers)) if len(pitch_inliers) > 0 else pitch_median
+
+                # Same median-trimmed approach for the skin-ratio
+                # baselines — one bad frame (a blink shadow, momentary
+                # motion blur) shouldn't skew what "unoccluded" means for
+                # the rest of the session either.
+                if _state["calibration_eyes_skin_samples"]:
+                    eyes_arr = np.array(_state["calibration_eyes_skin_samples"])
+                    eyes_med = float(np.median(eyes_arr))
+                    eyes_in = eyes_arr[np.abs(eyes_arr - eyes_med) <= 0.15]
+                    _state["neutral_eyes_skin_ratio"] = float(np.mean(eyes_in)) if len(eyes_in) > 0 else eyes_med
+                if _state["calibration_mouth_skin_samples"]:
+                    mouth_arr = np.array(_state["calibration_mouth_skin_samples"])
+                    mouth_med = float(np.median(mouth_arr))
+                    mouth_in = mouth_arr[np.abs(mouth_arr - mouth_med) <= 0.15]
+                    _state["neutral_mouth_skin_ratio"] = float(np.mean(mouth_in)) if len(mouth_in) > 0 else mouth_med
+
                 _state["calibrated"] = True
 
             # Don't penalize the candidate for a pose we have no baseline
@@ -735,7 +1074,7 @@ def process_frame(frame):
             analysis["attention"]["looking_at_screen"] = True
             analysis["attention"]["score"] = 100
 
-            primary_ok = not intrusion_detected
+            primary_ok = not intrusion_detected and not analysis["behavior"]["face_missing"]
             draw_face_boxes(frame, last_faces, primary_ok=primary_ok)
 
             current_time = time.time()
@@ -744,14 +1083,59 @@ def process_frame(frame):
             analysis["system"]["fps"] = round(fps, 2)
             return frame, analysis
 
+        # ================================================================
+        # STEP 1b — Generic (class-agnostic) occlusion check, now that a
+        # baseline exists. Combined with OR into the YOLO-based result
+        # computed earlier: either signal alone is enough to flag
+        # object_on_face/object_on_eyes. This is what catches an object
+        # YOLO doesn't recognize as any COCO class — a notebook, a mask,
+        # a hand held flat, anything — since it's judged by whether the
+        # region still looks like this person's calibrated skin baseline,
+        # not by trying to classify what's covering it.
+        # ================================================================
+        if _state["neutral_eyes_skin_ratio"] is not None and eyes_skin_ratio is not None:
+            if (_state["neutral_eyes_skin_ratio"] - eyes_skin_ratio) >= OCCLUSION_SKIN_DROP_THRESHOLD:
+                analysis["objects"]["object_on_eyes"] = False
+                analysis["objects"]["object_on_face"] = False
+
+        if _state["neutral_mouth_skin_ratio"] is not None and mouth_skin_ratio is not None:
+            if (_state["neutral_mouth_skin_ratio"] - mouth_skin_ratio) >= OCCLUSION_SKIN_DROP_THRESHOLD:
+                analysis["objects"]["object_on_face"] = False
+
         # ---- Smooth yaw/pitch with an EMA so one noisy solvePnP result
-        # (only 6 sparse points) doesn't flip the direction by itself. ----
-        prev_yaw = _state["yaw_ema"]
-        prev_pitch = _state["pitch_ema"]
-        yaw = raw_yaw if prev_yaw is None else (POSE_EMA_ALPHA * raw_yaw + (1 - POSE_EMA_ALPHA) * prev_yaw)
-        pitch = raw_pitch if prev_pitch is None else (POSE_EMA_ALPHA * raw_pitch + (1 - POSE_EMA_ALPHA) * prev_pitch)
-        _state["yaw_ema"] = yaw
-        _state["pitch_ema"] = pitch
+        # (only 6 sparse points) doesn't flip the direction by itself.
+        #
+        # IMPORTANT: only feed the EMA (and, further down, the debounce
+        # counter) a new sample when FaceMesh produced FRESH landmarks
+        # this call (run_mesh True, from further up in this function).
+        # raw_yaw/raw_pitch are a deterministic function of
+        # face_landmarks, and landmarks are only re-run every
+        # FACEMESH_EVERY_N_FRAMES calls — every process_frame() call in
+        # between recomputes the SAME raw_yaw/raw_pitch from the SAME
+        # cached landmarks. Previously the EMA (and the debounce below)
+        # ran on every call regardless of run_mesh, so instead of
+        # smoothing across many independent noisy readings, it just
+        # rapidly converged onto whatever the single latest independent
+        # reading was — a couple of identical inputs in a row is enough
+        # to drag an alpha=0.5 EMA almost the whole way there — and the
+        # debounce's "N consecutive contrary frames" was then satisfied
+        # almost instantly by that same repeated value. Net effect: a
+        # single noisy FaceMesh reading (a blink, a momentary
+        # micro-movement) could flip the displayed Focused/Distracted
+        # status within a fraction of a second — this is the "looking at
+        # screen sometimes True, sometimes False" flicker. Gating on
+        # run_mesh makes both defenses operate on genuinely independent
+        # samples again, the way they were originally intended to. ----
+        if run_mesh:
+            prev_yaw = _state["yaw_ema"]
+            prev_pitch = _state["pitch_ema"]
+            yaw = raw_yaw if prev_yaw is None else (POSE_EMA_ALPHA * raw_yaw + (1 - POSE_EMA_ALPHA) * prev_yaw)
+            pitch = raw_pitch if prev_pitch is None else (POSE_EMA_ALPHA * raw_pitch + (1 - POSE_EMA_ALPHA) * prev_pitch)
+            _state["yaw_ema"] = yaw
+            _state["pitch_ema"] = pitch
+        else:
+            yaw = _state["yaw_ema"] if _state["yaw_ema"] is not None else raw_yaw
+            pitch = _state["pitch_ema"] if _state["pitch_ema"] is not None else raw_pitch
 
         # ================================================================
         # STEP 2 — Classify by DEVIATION from this session's neutral pose,
@@ -788,16 +1172,23 @@ def process_frame(frame):
 
         # ---- Gaze: smooth the raw iris ratio with an EMA (gaze is
         # noisier than head pose, hence the lower alpha) before
-        # classifying it, instead of classifying a single raw reading. ----
-        raw_ratio = compute_gaze_ratio(face_landmarks)
-        prev_ratio = _state["gaze_ratio_ema"]
-        if raw_ratio is None:
-            smoothed_ratio = prev_ratio  # keep last known value; None -> classify_gaze_ratio treats as Center
+        # classifying it, instead of classifying a single raw reading.
+        # Same run_mesh gating as yaw/pitch above and for the same
+        # reason: face_landmarks (and therefore raw_ratio) don't change
+        # between mesh refreshes, so this is only a genuinely new sample
+        # when run_mesh is True. ----
+        if run_mesh:
+            raw_ratio = compute_gaze_ratio(face_landmarks)
+            prev_ratio = _state["gaze_ratio_ema"]
+            if raw_ratio is None:
+                smoothed_ratio = prev_ratio  # keep last known value; None -> classify_gaze_ratio treats as Center
+            else:
+                smoothed_ratio = raw_ratio if prev_ratio is None else (
+                    GAZE_EMA_ALPHA * raw_ratio + (1 - GAZE_EMA_ALPHA) * prev_ratio
+                )
+            _state["gaze_ratio_ema"] = smoothed_ratio
         else:
-            smoothed_ratio = raw_ratio if prev_ratio is None else (
-                GAZE_EMA_ALPHA * raw_ratio + (1 - GAZE_EMA_ALPHA) * prev_ratio
-            )
-        _state["gaze_ratio_ema"] = smoothed_ratio
+            smoothed_ratio = _state["gaze_ratio_ema"]
 
         gaze = classify_gaze_ratio(smoothed_ratio)
         analysis["attention"]["gaze_direction"] = gaze
@@ -817,15 +1208,22 @@ def process_frame(frame):
         # ================================================================
         raw_looking_at_screen = (gaze == "Center") and (direction == "Center")
 
+        # Same run_mesh gating as above: only advance the debounce counter
+        # on a genuinely new (fresh-landmark) reading. On cached-landmark
+        # calls, raw_looking_at_screen would just be repeating the same
+        # verdict already counted on the last fresh call, so leave
+        # `stable`/contrary_streak untouched rather than let a frozen
+        # value "confirm itself" over and over within one landmark epoch.
         stable = _state["stable_looking_at_screen"]
-        if raw_looking_at_screen == stable:
-            _state["contrary_streak"] = 0
-        else:
-            _state["contrary_streak"] += 1
-            if _state["contrary_streak"] >= ATTENTION_DEBOUNCE_FRAMES:
-                stable = raw_looking_at_screen
+        if run_mesh:
+            if raw_looking_at_screen == stable:
                 _state["contrary_streak"] = 0
-        _state["stable_looking_at_screen"] = stable
+            else:
+                _state["contrary_streak"] += 1
+                if _state["contrary_streak"] >= ATTENTION_DEBOUNCE_FRAMES:
+                    stable = raw_looking_at_screen
+                    _state["contrary_streak"] = 0
+            _state["stable_looking_at_screen"] = stable
 
         looking_at_screen = stable
         analysis["attention"]["looking_at_screen"] = looking_at_screen
@@ -840,22 +1238,29 @@ def process_frame(frame):
         # ---- Hard overrides — take priority over the gaze/head verdict
         # above regardless of what it says. (face_missing and multiple
         # faces are already handled by earlier early-returns in this
-        # function; this covers phone/object-on-eyes, the two overrides
-        # that can only be known this late once object-overlap has run.) ----
-        if analysis["objects"]["phone_detected"] or analysis["objects"]["object_on_eyes"]:
+        # function; this covers phone/object-on-eyes/hand-on-eyes, the
+        # overrides that can only be known this late once object/hand
+        # overlap has run.) ----
+        if analysis["objects"]["phone_detected"] or analysis["objects"]["object_on_eyes"] \
+                or analysis["behavior"]["face_missing"]:
+            # face_missing here (face IS being tracked, so this isn't the
+            # earlier "no face at all" early-return) means a hand is on
+            # the face/eyes — see the hand_on_face/hand_on_eyes block
+            # above, which is what actually sets it in this branch.
             analysis["attention"]["status"] = "Distracted"
             analysis["attention"]["looking_at_screen"] = False
             analysis["attention"]["score"] = 0
             # Keep the debounce state in sync with this override too, so a
-            # phone/object being removed doesn't instantly flip back to
-            # green off a single frame either.
+            # phone/object/hand being removed doesn't instantly flip back
+            # to green off a single frame either.
             _state["stable_looking_at_screen"] = False
 
     # ---------------- Draw the candidate's box ----------------
     # Green only when actually looking at the screen AND nobody else is
     # in frame. Red for distraction, phone/object override, OR intrusion
     # (someone else visible) — any of those alone is enough for red.
-    primary_ok = analysis["attention"]["looking_at_screen"] and not intrusion_detected
+    primary_ok = analysis["attention"]["looking_at_screen"] and not intrusion_detected \
+        and not analysis["behavior"]["face_missing"]
     draw_face_boxes(frame, last_faces, primary_ok=primary_ok)
 
     # ---------------- Draw landmarks on the full frame (optional) ----------------
@@ -871,3 +1276,4 @@ def process_frame(frame):
     analysis["system"]["fps"] = round(fps, 2)
 
     return frame, analysis
+#1075
